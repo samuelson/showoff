@@ -8,6 +8,7 @@ require 'logger'
 require 'htmlentities'
 require 'sinatra-websocket'
 require 'tempfile'
+require 'pry'
 
 here = File.expand_path(File.dirname(__FILE__))
 require "#{here}/showoff_utils"
@@ -411,7 +412,6 @@ class ShowOff < Sinatra::Application
         sl = build_forms(sl, content_classes)
         sl = update_p_classes(sl)
         sl = process_content_for_section_tags(sl, name, opts)
-        sl = process_content_for_div_tags(sl, name, opts)
         sl = update_special_content(sl, @slide_count, name) # TODO: deprecated
         sl = update_image_paths(name, sl, opts)
 
@@ -479,37 +479,70 @@ class ShowOff < Sinatra::Application
       result
     end
 
-    # Replace DIV tags with classed div tags
-    def process_content_for_div_tags(content, name = nil, opts = {})
-      return unless content
-
-      # because this is post markdown rendering, we may need to shift a <p> tag around
-      # remove the tags if they're by themselves
-      result = content.gsub(/<p>~~~DIV:([^~]*)~~~<\/p>/, '<div class="\1">')
-      result.gsub!(/<p>~~~ENDDIV~~~<\/p>/, '</div>')
-
-      # shove it around the div if it belongs to the contained element
-      result.gsub!(/(<p>)?~~~DIV:([^~]*)~~~/, '<div class="\2">\1')
-      result.gsub!(/~~~ENDDIV~~~(<\/p>)?/, '\1</div>')
-
-      result
+    def parse_custom_tag(p)
+      case p.content
+      when /\A~~~DIV:([^~\n]*)~~~\z/,/\A\.([^\[\n]*)\[\z/
+        return {"type" => "open", "classes" => $1}
+      when /\A~~~ENDDIV~~~\z/,/\A~~~ENDSECTION~~~\z/,/\A\]\z/,/\A\z/
+        return {"type" => "close"}
+      when /~~~DIV:([^~]*)~~~(.*)~~~ENDDIV~~~/m,/\.([^\[]*)\[(.*)\]/m
+        return {"type" => "oneline", "classes" => $1,
+                "content" => Nokogiri::HTML::DocumentFragment.parse("<p>#{$2}</p>")}
+      when /~~~DIV:([^~]*)~~~(.*)/m, /\.([^\[]*)\[(.*)/m
+        return {"type" => "openline", "classes" => $1,
+                "content" => Nokogiri::HTML::DocumentFragment.parse("<p>#{$2}</p>")}
+      when /([^~]*)~~~END(SECTION|DIV)~~~/m
+        return {"type" => "closeline", 
+                "content" => Nokogiri::HTML::DocumentFragment.parse("<p>#{$1}</p>")}
+      else 
+        return {"type" => "p"}
+      end
     end
+
+   def process_custom_tags(div)
+     result = Nokogiri::HTML::DocumentFragment.parse "<div></div>"
+     div.parent.children.each do |p|
+       tag = parse_custom_tag(p)
+       case tag['type']
+       when "p" # Add regular p tag as a child and move on
+         result.add_child(p) 
+       when "oneline" # For a oneliner, recurse on the content
+         p.name = "div"
+         p.content = ""
+         p['class'] = tag['classes']
+         p.children = process_custom_tags(tag['content'])
+         result.add_child(p) 
+         return result
+       when "open" # When a tag opens the rest of the tags become children
+         p.name = "div"
+         p['class'] = tag['classes']
+         p.children = process_custom_tags(p.siblings)
+         result.add_child(p)
+       when "openline"
+         p.name = "div"
+         p['class'] = tag['classes']
+         # Add the content as a child and append the other siblings
+         p.children = [tag['content']].append(process_custom_tags(p.siblings))
+         result.add_child(p)
+       when "close" # After the close tags, the grandparent adopts the rest of the tags
+         return result
+       when "closeline"
+         p.content = tag['content']
+         result.add_child(p)
+         return result
+       end
+    end
+   end
+
 
     # replace section tags with classed div tags including notes-section class
     def process_content_for_section_tags(content, name = nil, opts = {})
       return unless content
 
-      # because this is post markdown rendering, we may need to shift a <p> tag around
-      # remove the tags if they're by themselves
-      result = content.gsub(/<p>~~~SECTION:([^~]*)~~~<\/p>/, '<div class="notes-section \1">')
-      result.gsub!(/<p>~~~ENDSECTION~~~<\/p>/, '</div>')
+      doc = Nokogiri::HTML::DocumentFragment.parse(content)
 
-      # shove it around the div if it belongs to the contained element
-      result.gsub!(/(<p>)?~~~SECTION:([^~]*)~~~/, '<div class="notes-section \2">\1')
-      result.gsub!(/~~~ENDSECTION~~~(<\/p>)?/, '\1</div>')
-
-      # Turn this into a document for munging
-      doc = Nokogiri::HTML::DocumentFragment.parse(result)
+      # Start processing doc at first p tag
+      doc = process_custom_tags(doc.at('p'))
 
       filename = File.join(settings.pres_dir, '_notes', "#{name}.md")
       @logger.debug "personal notes filename: #{filename}"
